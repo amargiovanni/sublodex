@@ -400,6 +400,10 @@ If it doesn't explode on first launch, you're probably fine.
 
 SubLodeX — by **Amani Andrea** aka *The Pirate Pinperepette*.
 
+If this saves you time, throw a coin to your captain:
+
+<a href="https://www.buymeacoffee.com/pinperepette" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-red.png" alt="Buy Me a Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
 ---
 
 ## License
