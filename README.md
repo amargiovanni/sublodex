@@ -7,10 +7,10 @@ Multi-project workspace, live file streaming, integrated terminal (local + SSH),
 
 <p align="center">
   <a href="docs/img/03-live-streaming.mp4">
-    <img src="docs/img/03-live-streaming.gif" alt="Claude writing a Python file token-by-token in Monaco at slow speed" />
+    <img src="docs/img/03-live-streaming.gif" alt="Claude writing a Python file token-by-token in Monaco" />
   </a>
   <br />
-  <em>Claude writing a file live in the editor — click for higher-quality MP4.</em>
+  <strong>This isn't a wrapper.</strong> The editor on the right shows the file being written, character by character, while Claude generates it. <em>Click for the higher-quality MP4.</em>
 </p>
 
 ![SubLodeX main UI — sidebar (commands/files/git), chat in the middle, editor on the right, terminal at the bottom](docs/img/01-hero.png)
@@ -207,7 +207,7 @@ Point a project at a remote and everything runs there:
 * connection reuse via `ControlMaster`
 * file tree, file open/save, terminal, claude — all over SSH
 
-Claude runs *on the remote* (uses the remote's `claude` CLI). The local app proxies the conversation. **Live file streaming is not available for remote edits** — Claude CLI doesn't emit partial tool input over its stream-json output. Tool results still arrive, just no per-character animation.
+Claude runs *on the remote* (uses the remote's `claude` CLI). The local app proxies the conversation. **No per-character live streaming when editing remote files** — this is a **Claude CLI limitation**, not ours: the CLI's stream-json output doesn't emit partial tool input the way the local SDK does. Tool results still arrive (you see the diff after the tool returns), just no typewriter animation during the write.
 
 (See `02-projects.png` above for the SSH form.)
 
@@ -406,4 +406,4 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Closing note
 
-This isn't a wrapper around Claude. It's an attempt to make AI feel like part of the dev environment, not an external tool you tab to. Once you get used to watching files write themselves, copy-pasting from a chat starts to feel kind of broken.
+Once you get used to watching files write themselves, copy-pasting code from a chat feels broken.
