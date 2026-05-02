@@ -1,0 +1,53 @@
+# dependencies
+node_modules/
+bun.lockb
+package-lock.json
+yarn.lock
+
+# build output
+dist/
+src-tauri/target/
+# tutto src-tauri/resources è auto-generato da scripts/bundle-resources.mjs
+# (dist, server.bundled.mjs, claude-bin, ecc.) — mai committato
+src-tauri/resources/
+# bun binaries: scaricati al volo da CI per ogni platform; mai committati
+src-tauri/binaries/
+
+# user data / settings (mai committati)
+.data/
+workspace/
+
+# editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Claude Code config (mai)
+.claude/
+.specstory/
+
+# logs
+*.log
+*.log.*
+
+# backups locali
+*.bak
+*-backup-*
+*.app.bak
+SubLodeX.app.bak/
+
+# env
+.env
+.env.local
+.env.*.local
+
+# misc
+*.tsbuildinfo
+
+# raw screen recordings: i derivati (gif/mp4) sono committati, il mov no
+docs/img/raw-*.mov
+
+# bundle artifacts pronti per release: vanno caricati come Release artifacts,
+# non committati (sono pesanti).
+dist-bundles/

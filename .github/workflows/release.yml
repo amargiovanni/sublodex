@@ -1,0 +1,128 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon
+          - os: macos-14
+            rust_target: aarch64-apple-darwin
+            bun_url: https://github.com/oven-sh/bun/releases/latest/download/bun-darwin-aarch64.zip
+            bun_archive: bun-darwin-aarch64
+          # macOS Intel
+          - os: macos-13
+            rust_target: x86_64-apple-darwin
+            bun_url: https://github.com/oven-sh/bun/releases/latest/download/bun-darwin-x64.zip
+            bun_archive: bun-darwin-x64
+          # Linux x86_64
+          - os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            bun_url: https://github.com/oven-sh/bun/releases/latest/download/bun-linux-x64.zip
+            bun_archive: bun-linux-x64
+          # Windows x86_64
+          - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            bun_url: https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64.zip
+            bun_archive: bun-windows-x64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux deps for Tauri
+      - name: install linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: download bun sidecar
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          cd /tmp
+          curl -fsSL "${{ matrix.bun_url }}" -o bun.zip
+          unzip -oq bun.zip
+          # bun zip extracts to e.g. bun-darwin-x64/bun (or bun-windows-x64/bun.exe)
+          if [ -f "${{ matrix.bun_archive }}/bun.exe" ]; then
+            cp "${{ matrix.bun_archive }}/bun.exe" "$GITHUB_WORKSPACE/src-tauri/binaries/bun-${{ matrix.rust_target }}.exe"
+          else
+            cp "${{ matrix.bun_archive }}/bun" "$GITHUB_WORKSPACE/src-tauri/binaries/bun-${{ matrix.rust_target }}"
+            chmod 755 "$GITHUB_WORKSPACE/src-tauri/binaries/bun-${{ matrix.rust_target }}"
+          fi
+          ls -la "$GITHUB_WORKSPACE/src-tauri/binaries/"
+
+      - name: install npm/bun dependencies
+        run: bun install
+
+      - name: tauri build
+        env:
+          # Tauri 2: codice di firma opzionale; al primo release pubblichiamo unsigned
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bun run tauri:build
+
+      - name: upload artifacts (mac)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubLodeX-${{ matrix.rust_target }}
+          path: |
+            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/dmg/*.dmg
+
+      - name: upload artifacts (linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubLodeX-${{ matrix.rust_target }}
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/rpm/*.rpm
+
+      - name: upload artifacts (windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubLodeX-${{ matrix.rust_target }}
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+
+      - name: publish to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe

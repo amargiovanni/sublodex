@@ -1,0 +1,59 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "SubLodeX",
+  "version": "0.1.0",
+  "identifier": "com.pinperepette.sublodex",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": {
+      "script": "bun run dev",
+      "wait": false
+    },
+    "beforeBuildCommand": "bun run build && bun run bundle:server && bun run bundle:resources"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SubLodeX",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false,
+        "center": true,
+        "url": "http://localhost:3001"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/bun"
+    ],
+    "resources": [
+      "resources/server.bundled.mjs",
+      "resources/dist/**/*",
+      "resources/claude-bin/**/*"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "SubLodeX — Claude Code web UI as a desktop app",
+    "longDescription": "SubLodeX is a desktop app that wraps a local web UI for Claude Code, with multi-project support, integrated terminal (local + SSH), file editor and live streaming.",
+    "publisher": "Amani Andrea aka The Pirate Pinperepette",
+    "copyright": "© 2026 Amani Andrea aka The Pirate Pinperepette"
+  }
+}

@@ -1,0 +1,87 @@
+import type { UIMessage } from './types';
+
+export type ConversationSnapshot = {
+  messages: UIMessage[];
+  sessionId?: string | null;
+  totalCost?: number;
+  totalInput?: number;
+  totalOutput?: number;
+  turns?: number;
+  /** id del file su disco usato per questa sessione (server-side) */
+  __sessionFsId?: string;
+};
+
+export type SessionMeta = {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  messageCount: number;
+  summary: string;
+};
+
+function withSession(projectId: string, sessionId?: string | null): string {
+  const base = `projectId=${encodeURIComponent(projectId)}`;
+  return sessionId ? `${base}&sessionId=${encodeURIComponent(sessionId)}` : base;
+}
+
+export async function loadConversation(
+  projectId: string,
+  sessionId?: string | null,
+): Promise<ConversationSnapshot | null> {
+  try {
+    const r = await fetch(`/api/conversation?${withSession(projectId, sessionId)}`);
+    if (!r.ok) return null;
+    return (await r.json()) as ConversationSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveConversation(
+  projectId: string,
+  snap: ConversationSnapshot,
+  sessionId?: string | null,
+): Promise<void> {
+  try {
+    await fetch(`/api/conversation?${withSession(projectId, sessionId)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(snap),
+    });
+  } catch { /* best effort */ }
+}
+
+export async function deleteConversation(
+  projectId: string,
+  sessionId?: string | null,
+): Promise<void> {
+  try {
+    await fetch(`/api/conversation?${withSession(projectId, sessionId)}`, {
+      method: 'DELETE',
+    });
+  } catch { /* best effort */ }
+}
+
+export async function listSessions(projectId: string): Promise<SessionMeta[]> {
+  try {
+    const r = await fetch(`/api/conversation/sessions?projectId=${encodeURIComponent(projectId)}`);
+    if (!r.ok) return [];
+    const j = (await r.json()) as { sessions: SessionMeta[] };
+    return j.sessions ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function createNewSession(projectId: string): Promise<string | null> {
+  try {
+    const r = await fetch(`/api/conversation/sessions?projectId=${encodeURIComponent(projectId)}`, {
+      method: 'POST',
+    });
+    if (!r.ok) return null;
+    const j = (await r.json()) as { id: string };
+    return j.id ?? null;
+  } catch {
+    return null;
+  }
+}

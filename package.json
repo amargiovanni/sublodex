@@ -1,0 +1,44 @@
+{
+  "name": "sublodex",
+  "version": "0.0.1",
+  "type": "module",
+  "author": "Amani Andrea aka The Pirate Pinperepette",
+  "scripts": {
+    "server": "bun run --hot server.ts",
+    "web": "vite",
+    "dev": "concurrently -n server,web -c yellow,cyan \"bun run server\" \"bun run web\"",
+    "build": "vite build",
+    "bundle:server": "bun build server.ts --target=bun --outfile=src-tauri/resources/server.bundled.mjs",
+    "bundle:resources": "node scripts/bundle-resources.mjs",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.126",
+    "@monaco-editor/react": "^4.6.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "clsx": "^2.1.1",
+    "node-pty": "^1.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "react-resizable-panels": "^2.1.0",
+    "react-syntax-highlighter": "^15.5.0",
+    "remark-gfm": "^4.0.0",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/cli": "^2.11.0",
+    "@types/bun": "latest",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/react-syntax-highlighter": "^15.5.13",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^8.2.2",
+    "typescript": "^5.5.3",
+    "vite": "^5.4.0"
+  }
+}
