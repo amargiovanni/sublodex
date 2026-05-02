@@ -1,8 +1,9 @@
 # SubLodeX
 
-A local-first desktop app on top of Claude Code. Multi-project workspace, live file streaming, integrated terminal (local + SSH), git tooling, and per-project chat sessions — all in one window.
+<h3 align="center">A local-first desktop app for Claude Code</h3>
+<p align="center"><em>It feels like a dev environment that happens to have an AI inside, not a chat with code stapled on the side.</em></p>
 
-It feels like a dev environment that happens to have an AI inside, not a chat with code stapled on the side.
+Multi-project workspace, live file streaming, integrated terminal (local + SSH), git tooling, and per-project chat sessions — all in one window.
 
 <p align="center">
   <a href="docs/img/03-live-streaming.mp4">
