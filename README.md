@@ -1,5 +1,9 @@
 # SubLodeX
 
+<p align="center">
+  <img src="docs/img/00-cover.png" alt="SubLodeX — by Amani Andrea aka The Pirate Pinperepette" />
+</p>
+
 <h3 align="center">A local-first desktop app for Claude Code</h3>
 <p align="center"><em>It feels like a dev environment that happens to have an AI inside, not a chat with code stapled on the side.</em></p>
 
