@@ -4,7 +4,15 @@ A local-first desktop app on top of Claude Code. Multi-project workspace, live f
 
 It feels like a dev environment that happens to have an AI inside, not a chat with code stapled on the side.
 
-![hero — main UI: sidebar (commands/files/git), chat in the middle, editor on the right, terminal at the bottom](docs/img/01-hero.png)
+<p align="center">
+  <a href="docs/img/03-live-streaming.mp4">
+    <img src="docs/img/03-live-streaming.gif" alt="Claude writing a Python file token-by-token in Monaco at slow speed" />
+  </a>
+  <br />
+  <em>Claude writing a file live in the editor — click for higher-quality MP4.</em>
+</p>
+
+![SubLodeX main UI — sidebar (commands/files/git), chat in the middle, editor on the right, terminal at the bottom](docs/img/01-hero.png)
 
 ---
 
@@ -103,15 +111,7 @@ There's a **speed regulator** because at full speed you barely see it:
 * `normal` — ~100 char/s
 * `slow` — ~33 char/s, true typewriter
 
-Set it from *projects → live file write speed*.
-
-<p align="center">
-  <a href="docs/img/03-live-streaming.mp4">
-    <img src="docs/img/03-live-streaming.gif" alt="streaming — Claude writing a Python file token-by-token in Monaco at slow speed" />
-  </a>
-  <br />
-  <em>Click for higher-quality MP4.</em>
-</p>
+Set it from *projects → live file write speed*. *(see the GIF at the top of this README for a demo)*
 
 ### Real terminal (local + SSH)
 
