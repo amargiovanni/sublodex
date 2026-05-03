@@ -81,6 +81,34 @@ export type ToolResultBlock = {
   is_error?: boolean;
 };
 
+/* ---- type guards per StreamEvent ----
+ *
+ * Il tipo `StreamEvent` ha un fallback `{type:string;[k:string]:unknown}`
+ * (per accomodare future varianti del SDK), che impedisce a TS di fare
+ * narrowing automatico su `event.type === 'system'` ecc. — perché il
+ * fallback combacia con qualsiasi `type`. Questi guard ripristinano la
+ * discriminazione lato chiamante (store.ts), senza dover usare `as any`.
+ */
+export function isSystemInitEvent(e: StreamEvent): e is SystemInitEvent {
+  return e.type === 'system' && (e as { subtype?: unknown }).subtype === 'init';
+}
+export function isAssistantEvent(e: StreamEvent): e is AssistantEvent {
+  return e.type === 'assistant'
+    && typeof (e as { message?: unknown }).message === 'object'
+    && (e as { message?: { id?: unknown } }).message != null;
+}
+export function isUserEvent(e: StreamEvent): e is UserEvent {
+  return e.type === 'user'
+    && typeof (e as { message?: unknown }).message === 'object'
+    && (e as { message?: unknown }).message != null;
+}
+export function isStreamEventWrap(e: StreamEvent): e is StreamEventWrap {
+  return e.type === 'stream_event';
+}
+export function isResultEvent(e: StreamEvent): e is ResultEvent {
+  return e.type === 'result';
+}
+
 export type ServerMessage =
   | { type: 'event'; event: StreamEvent }
   | { type: 'done' }

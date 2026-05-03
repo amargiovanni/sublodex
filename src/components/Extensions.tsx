@@ -25,9 +25,20 @@ type PluginInstall = {
   };
 };
 
+/** Shape del campo `source` su un Marketplace.
+ *  Il backend (`readPluginsState`) emette varianti diverse a seconda
+ *  della provenienza: github (`source: 'github'` + `repo`), URL bare
+ *  (`url`), o altri formati ancora ignoti. Manteniamo permissivo via
+ *  Record<string, unknown>, e leggiamo i campi attesi come opzionali. */
+type MarketplaceSource = {
+  source?: string;
+  repo?: string;
+  url?: string;
+} & Record<string, unknown>;
+
 type Marketplace = {
   name: string;
-  source: any;
+  source: MarketplaceSource;
   installLocation?: string;
   lastUpdated?: string;
 };
@@ -491,13 +502,11 @@ function MarketplacesList({ data }: { data: PluginsState }) {
   return (
     <div className="ext__list">
       {data.marketplaces.map((m) => {
-        const src = m.source ?? {};
-        const repo = (src as any).repo;
-        const url = (src as any).url;
+        const src: MarketplaceSource = m.source ?? {};
         const sourceLabel =
-          (src as any).source === 'github' && repo
-            ? `github:${repo}`
-            : url ?? JSON.stringify(src);
+          src.source === 'github' && src.repo
+            ? `github:${src.repo}`
+            : src.url ?? JSON.stringify(src);
         return (
           <div className="ext-market" key={m.name}>
             <div className="ext-market__head">

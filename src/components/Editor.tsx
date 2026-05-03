@@ -66,8 +66,11 @@ const beforeMount: BeforeMount = (monaco) => {
 };
 
 export function Editor() {
-  const ref = useRef<HTMLElement>(null);
-  useScopedTheme(ref as any, 'editor');
+  // `HTMLElement | null` allinea il tipo del ref alla signature di
+  // useScopedTheme (`RefObject<HTMLElement | null>`); senza la nullability
+  // esplicita TS non rende compatibili i due RefObject (varianza).
+  const ref = useRef<HTMLElement | null>(null);
+  useScopedTheme(ref, 'editor');
   const openFiles = useStore((s) => s.openFiles);
   const activeFile = useStore((s) => s.activeFile);
   const setActiveFile = useStore((s) => s.setActiveFile);
@@ -252,7 +255,9 @@ function EditorPane({ filePath }: { filePath: string }) {
     if (!isDiff || !diffInfo) return filePath;
     if (diffInfo.kind === 'commit') return `commit · ${diffInfo.hash}`;
     if (diffInfo.kind === 'range') return `range · ${diffInfo.from}...${diffInfo.to}`;
-    return `${diffInfo.kind} · ${(diffInfo as any).path}`;
+    // Dopo gli early-return sopra, TS sa che diffInfo.kind è 'workdir' | 'staged'
+    // e quei rami della discriminated union hanno entrambi `path: string`.
+    return `${diffInfo.kind} · ${diffInfo.path}`;
   })();
 
   return (

@@ -9,7 +9,12 @@ import type {
   StreamEventWrap,
   UIBlock,
   UIMessage,
-  UserEvent,
+} from './types';
+import {
+  isAssistantEvent,
+  isStreamEventWrap,
+  isSystemInitEvent,
+  isUserEvent,
 } from './types';
 
 type ToolStreamState = {
@@ -257,22 +262,21 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   ingestEvent: (event) => {
-    if (event.type === 'system' && (event as any).subtype === 'init') {
-      const ev = event as any;
+    if (isSystemInitEvent(event)) {
       set({
-        sessionId: ev.session_id,
-        runtimeModel: typeof ev.model === 'string' ? ev.model : undefined,
+        sessionId: event.session_id,
+        runtimeModel: typeof event.model === 'string' ? event.model : undefined,
       });
       return;
     }
 
-    if (event.type === 'stream_event') {
-      handleStreamEvent(event as StreamEventWrap, set);
+    if (isStreamEventWrap(event)) {
+      handleStreamEvent(event, set);
       return;
     }
 
-    if (event.type === 'assistant') {
-      const msg = (event as AssistantEvent).message;
+    if (isAssistantEvent(event)) {
+      const msg = event.message;
       const blocks = toUIBlocks(msg.content);
       set((s) => {
         const idx = s.messages.findIndex((m) => m.id === msg.id);
@@ -303,8 +307,8 @@ export const useStore = create<Store>((set, get) => ({
       return;
     }
 
-    if (event.type === 'user') {
-      const msg = (event as UserEvent).message;
+    if (isUserEvent(event)) {
+      const msg = event.message;
       for (const block of msg.content) {
         if (block.type !== 'tool_result') continue;
         const toolId = block.tool_use_id;
@@ -494,7 +498,7 @@ function handleStreamEvent(
   }
 
   if (ev.type === 'message_start') {
-    const id = (ev as any).message?.id;
+    const id = ev.message?.id;
     if (id) {
       set((s) => {
         if (s.messages.some((m) => m.id === id)) return {};

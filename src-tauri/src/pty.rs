@@ -25,6 +25,36 @@ use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::State;
 
+/// Whitelist delle shell remote accettabili. Serde rifiuta valori fuori
+/// enum con errore di deserializzazione → arriva al frontend come
+/// `Err(String)` da `pty_open`. Niente input arbitrario che finisce in
+/// `format!("exec {} -l", ...)`. Mantenere allineato con
+/// `RemoteConfig.shellType` lato TS (`src/lib/types.ts`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellType {
+    Auto,
+    Bash,
+    Zsh,
+    Sh,
+    Fish,
+}
+
+impl ShellType {
+    /// Stringa che finisce dentro `cd <path> && exec <shell> -l` sulla
+    /// shell remota. `Auto` → `$SHELL` (la shell di default dell'utente
+    /// remoto, espanso da sh).
+    fn as_remote_token(&self) -> &'static str {
+        match self {
+            ShellType::Auto => "$SHELL",
+            ShellType::Bash => "bash",
+            ShellType::Zsh => "zsh",
+            ShellType::Sh => "sh",
+            ShellType::Fish => "fish",
+        }
+    }
+}
+
 /// Config SSH passata dal frontend, mirror lato Rust di
 /// `RemoteConfig` lato TS (`src/lib/types.ts`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -43,9 +73,10 @@ pub struct SshConfig {
     pub agent_forwarding: Option<bool>,
     #[serde(default)]
     pub remote_path: Option<String>,
-    /// "auto" | "bash" | "zsh" | "sh" | "fish"
+    /// Whitelist enum: "auto" | "bash" | "zsh" | "sh" | "fish".
+    /// Valori fuori whitelist → errore in deserialize.
     #[serde(default)]
-    pub shell_type: Option<String>,
+    pub shell_type: Option<ShellType>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,14 +108,36 @@ struct Session {
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
+/// Mappa sessioni con lock granulare:
+/// - Mutex esterno breve: solo `get` / `insert` / `remove` sull'HashMap.
+/// - Mutex per-sessione: tenuto durante write / resize / kill.
+///
+/// Prima del refactor il Mutex era unico e globale: `pty_write` su una
+/// sessione bloccava tutte le altre. Con N terminali aperti questo si
+/// vede come "lag" su tutti quando uno solo riceve molto input.
 #[derive(Default)]
 pub struct PtyManager {
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
 }
 
 impl PtyManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Killa esplicitamente tutte le sessioni viventi. Da chiamare su
+    /// `WindowEvent::CloseRequested` / `RunEvent::ExitRequested` come
+    /// cintura: il `Drop` di `Session` chiuderebbe il master comunque,
+    /// ma su alcune piattaforme (specie macOS con SSH) il client SSH
+    /// resta in giro fino al timeout SIGHUP. Il kill esplicito è
+    /// più affidabile.
+    pub fn kill_all(&self) {
+        let sessions: Vec<Arc<Mutex<Session>>> =
+            self.sessions.lock().drain().map(|(_, v)| v).collect();
+        for arc in sessions {
+            let mut s = arc.lock();
+            let _ = s.child.kill();
+        }
     }
 }
 
@@ -122,6 +175,50 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Espande `~` iniziale a `$HOME`. Path SSH come `~/.ssh/id_rsa` arrivano
+/// dal frontend in forma "tilde": ssh in argv NON le espande (lo fa la shell),
+/// quindi le risolviamo qui.
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::Path::new(&home).join(rest).to_string_lossy().into_owned();
+        }
+    } else if p == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return home.to_string_lossy().into_owned();
+        }
+    }
+    p.to_string()
+}
+
+/// Valida un path di identity file: deve esistere ed essere un regular file.
+/// Threat: una WebView XSS-ata potrebbe passare path arbitrari per probare il
+/// filesystem (oracle "esiste/non esiste") o causare comportamenti strani in
+/// `ssh -i`. Restituiamo Err sul path non valido invece di lasciare proseguire
+/// con un argv malformato.
+fn validate_identity_file(p: &str) -> Result<String, String> {
+    let expanded = expand_tilde(p);
+    let path = std::path::Path::new(&expanded);
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("identity file not accessible: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("identity file is not a regular file: {expanded}"));
+    }
+    Ok(expanded)
+}
+
+/// Valida un cwd locale: deve esistere ed essere una directory.
+fn validate_cwd(p: &str) -> Result<String, String> {
+    let expanded = expand_tilde(p);
+    let path = std::path::Path::new(&expanded);
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("cwd not accessible: {e}"))?;
+    if !meta.is_dir() {
+        return Err(format!("cwd is not a directory: {expanded}"));
+    }
+    Ok(expanded)
+}
+
 /// Costruisce il `CommandBuilder` per lanciare la shell o `ssh`.
 fn build_command(opts: &PtyOpenOpts) -> Result<CommandBuilder, String> {
     match opts.kind.as_str() {
@@ -147,7 +244,8 @@ fn build_local(opts: &PtyOpenOpts) -> Result<CommandBuilder, String> {
         cmd.arg("-l");
     }
     if let Some(cwd) = &opts.cwd {
-        cmd.cwd(cwd);
+        let validated = validate_cwd(cwd)?;
+        cmd.cwd(validated);
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -183,6 +281,34 @@ fn which_exec(name: &str) -> Option<std::path::PathBuf> {
 #[cfg(not(windows))]
 fn which_exec(_name: &str) -> Option<std::path::PathBuf> { None }
 
+/// Trova `sshpass` con path assoluto. In `.app` su macOS lanciata via
+/// Finder/Dock il PATH è solo `/usr/bin:/bin:/usr/sbin:/sbin`, quindi
+/// `sshpass` da Homebrew (`/opt/homebrew/bin` su Apple Silicon,
+/// `/usr/local/bin` su Intel) non è raggiungibile come bare name.
+/// Stessa lista di `whichBin('sshpass', …)` in `server.ts`.
+fn resolve_sshpass() -> Option<String> {
+    // 1. PATH dell'utente (raro che funzioni in GUI app, ma costa nulla).
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let p = dir.join("sshpass");
+            if p.exists() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    // 2. Install dir comuni di Homebrew + system.
+    for p in &[
+        "/opt/homebrew/bin/sshpass",
+        "/usr/local/bin/sshpass",
+        "/usr/bin/sshpass",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return Some((*p).to_string());
+        }
+    }
+    None
+}
+
 fn build_ssh(opts: &PtyOpenOpts) -> Result<CommandBuilder, String> {
     let ssh = opts
         .ssh
@@ -198,8 +324,9 @@ fn build_ssh(opts: &PtyOpenOpts) -> Result<CommandBuilder, String> {
         }
     }
     if let Some(key) = &ssh.identity_file {
+        let validated = validate_identity_file(key)?;
         args.push("-i".to_string());
-        args.push(key.clone());
+        args.push(validated);
     }
     if ssh.agent_forwarding.unwrap_or(false) {
         args.push("-A".to_string());
@@ -232,10 +359,13 @@ fn build_ssh(opts: &PtyOpenOpts) -> Result<CommandBuilder, String> {
     args.push(target);
 
     if let Some(remote_path) = &ssh.remote_path {
-        let shell_type = ssh
+        // Token già in whitelist (enum `ShellType`): non c'è bisogno di
+        // quoting shell perché sono identificatori innocui o `$SHELL`,
+        // che vogliamo *sia* espanso dalla sh remota.
+        let shell_token = ssh
             .shell_type
-            .as_deref()
-            .filter(|s| *s != "auto")
+            .as_ref()
+            .map(|s| s.as_remote_token())
             .unwrap_or("$SHELL");
         // `ssh host -- sh -c '...'` — un singolo arg post-host non viene rotto.
         args.push("--".to_string());
@@ -244,15 +374,27 @@ fn build_ssh(opts: &PtyOpenOpts) -> Result<CommandBuilder, String> {
         args.push(format!(
             "cd {} && exec {} -l",
             shell_quote(remote_path),
-            shell_type
+            shell_token
         ));
     }
 
-    let (program, prepend) = if let Some(pwd) = &ssh.password {
-        // sshpass non bundlato: deve essere in PATH dell'utente.
-        ("sshpass".to_string(), vec!["-p".to_string(), pwd.clone(), "ssh".to_string()])
+    // Sicurezza: se c'è una password, usiamo `sshpass -e` (legge $SSHPASS
+    // dall'env), MAI `-p <pwd>` (visibile in `ps aux`).
+    //
+    // Path: in un'app Tauri lanciata via Finder/Dock il PATH è minimale
+    // (`/usr/bin:/bin:/usr/sbin:/sbin`), quindi `sshpass` da Homebrew non
+    // si trova. Risolviamo a path assoluto cercando nelle install dir
+    // comuni — stessa logica di `whichBin` in `server.ts`.
+    let (program, prepend, sshpass_env) = if let Some(pwd) = &ssh.password {
+        let bin = resolve_sshpass()
+            .ok_or_else(|| "sshpass not found. Install with: brew install hudochenkov/sshpass/sshpass".to_string())?;
+        (
+            bin,
+            vec!["-e".to_string(), "ssh".to_string()],
+            Some(pwd.clone()),
+        )
     } else {
-        ("ssh".to_string(), vec![])
+        ("ssh".to_string(), vec![], None)
     };
 
     let mut cmd = CommandBuilder::new(&program);
@@ -261,6 +403,9 @@ fn build_ssh(opts: &PtyOpenOpts) -> Result<CommandBuilder, String> {
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    if let Some(pwd) = sshpass_env {
+        cmd.env("SSHPASS", pwd);
+    }
     Ok(cmd)
 }
 
@@ -305,15 +450,16 @@ pub async fn pty_open(
 
     // Inserisci la sessione PRIMA di lanciare la lettura, così pty_write
     // chiamato subito dopo trova qualcosa.
+    // Lock granulare: il Mutex per-sessione è dentro l'Arc, l'HashMap fuori.
     {
         let mut map = state.sessions.lock();
         map.insert(
             session_id.clone(),
-            Session {
+            Arc::new(Mutex::new(Session {
                 writer,
                 master: pair.master,
                 child,
-            },
+            })),
         );
     }
 
@@ -363,6 +509,12 @@ pub async fn pty_open(
     Ok(session_id)
 }
 
+/// Estrae l'Arc<Mutex<Session>> dalla mappa, tenendo il lock esterno solo per
+/// il tempo del get + clone Arc. Restituisce None se la sessione non esiste.
+fn get_session(state: &PtyManager, session_id: &str) -> Option<Arc<Mutex<Session>>> {
+    state.sessions.lock().get(session_id).cloned()
+}
+
 #[tauri::command]
 pub async fn pty_write(
     state: State<'_, PtyManager>,
@@ -374,10 +526,10 @@ pub async fn pty_write(
     let bytes = B64
         .decode(data.as_bytes())
         .map_err(|e| format!("invalid base64 input: {e}"))?;
-    let mut map = state.sessions.lock();
-    let session = map
-        .get_mut(&session_id)
+    let session_arc = get_session(&state, &session_id)
         .ok_or_else(|| format!("unknown session: {session_id}"))?;
+    // Lock solo della sessione target — le altre sessioni restano libere.
+    let mut session = session_arc.lock();
     session
         .writer
         .write_all(&bytes)
@@ -396,10 +548,9 @@ pub async fn pty_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let map = state.sessions.lock();
-    let session = map
-        .get(&session_id)
+    let session_arc = get_session(&state, &session_id)
         .ok_or_else(|| format!("unknown session: {session_id}"))?;
+    let session = session_arc.lock();
     session
         .master
         .resize(PtySize {
@@ -417,8 +568,11 @@ pub async fn pty_close(
     state: State<'_, PtyManager>,
     session_id: String,
 ) -> Result<(), String> {
-    let mut map = state.sessions.lock();
-    if let Some(mut session) = map.remove(&session_id) {
+    // Rimuovi dalla mappa, poi killa: il read loop chiuderà naturalmente
+    // su EOF e tenterà un secondo remove (no-op).
+    let removed = state.sessions.lock().remove(&session_id);
+    if let Some(arc) = removed {
+        let mut session = arc.lock();
         let _ = session.child.kill();
     }
     Ok(())

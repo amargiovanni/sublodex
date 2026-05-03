@@ -182,9 +182,11 @@ export const THEMES: Record<ThemeId, Theme> = {
   'solarized-dark': solarizedDark, 'github-light': githubLight,
 };
 
-export const THEME_LIST: Theme[] = [
-  monokai, dracula, tokyonight, 'one-dark' as any, nord, solarizedDark, githubLight,
-].map((x) => typeof x === 'string' ? THEMES[x] : x);
+// Lista mista di Theme objects e ThemeId stringhe; il map finale risolve
+// le stringhe nei Theme corrispondenti. Tipizzata come union, niente as any.
+export const THEME_LIST: Theme[] = ([
+  monokai, dracula, tokyonight, 'one-dark', nord, solarizedDark, githubLight,
+] as Array<Theme | ThemeId>).map((x): Theme => (typeof x === 'string' ? THEMES[x as ThemeId] : x));
 
 export function themeVarsCss(c: ThemeColors): Record<string, string> {
   return {

@@ -5,6 +5,13 @@ import { deleteConversation } from '../lib/conversation';
 import { EyeIcon, EyeOffIcon, FolderIcon } from './icons';
 import type { Project, RemoteConfig } from '../lib/types';
 
+/** Sentinel scambiato col server quando l'utente non vuole modificare la
+ *  password SSH già salvata. Il backend redact-a la password reale nei
+ *  response e accetta indietro il sentinel come "tieni quella esistente".
+ *  Lato UI: mostriamo un placeholder con asterischi ma manteniamo il
+ *  sentinel nello state finché l'utente non digita una nuova stringa. */
+const PWD_REDACT_SENTINEL = '__SUBLODEX_PWD_KEEP__';
+
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const remote = useSettings((s) => s.settings);
   const loading = useSettings((s) => s.loading);
@@ -402,9 +409,18 @@ function RemoteSection({ selected, sshHosts, onChange }: {
                 <input
                   className="field__input field__input--mono"
                   type={showPwd ? 'text' : 'password'}
-                  value={remote.password ?? ''}
+                  /* Quando lo state è il sentinel (= password presente lato
+                   * server, redacted in response) lasciamo il campo vuoto
+                   * a video: il placeholder dice all'utente che è settata.
+                   * Se l'utente digita, sostituiamo il sentinel con la
+                   * nuova stringa e il PUT manderà quella. */
+                  value={remote.password === PWD_REDACT_SENTINEL ? '' : (remote.password ?? '')}
                   onChange={(e) => update({ password: e.target.value || undefined })}
-                  placeholder="(optional — prefer key-based auth)"
+                  placeholder={
+                    remote.password === PWD_REDACT_SENTINEL
+                      ? '•••••• (set — type to change)'
+                      : '(optional — prefer key-based auth)'
+                  }
                 />
                 <button
                   type="button"

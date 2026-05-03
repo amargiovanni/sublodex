@@ -51,3 +51,9 @@ docs/img/raw-*.mov
 # bundle artifacts pronti per release: vanno caricati come Release artifacts,
 # non committati (sono pesanti).
 dist-bundles/
+
+# bundle artifacts: file pesanti distribuiti via GitHub Releases
+releases/
+
+# project marker auto-generato, contiene path locali
+CLAUDE.md

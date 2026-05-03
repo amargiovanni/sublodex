@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useTheme, resolveTheme } from '../lib/themeStore';
+import { useTheme, resolveTheme, type ThemeSettings } from '../lib/themeStore';
 import { THEMES, THEME_LIST, type ThemeId, type Scope } from '../lib/themes';
 
 const SCOPE_TABS: { id: Scope; label: string; hint: string }[] = [
@@ -16,7 +16,9 @@ export function ThemePicker({ onClose }: { onClose: () => void }) {
 
   const currentForScope = (sc: Scope): ThemeId | null => {
     if (sc === 'global') return t.global;
-    return (t as any)[sc] ?? null;
+    // Cast a ThemeSettings (parent) per indicizzare solo le proprietà
+    // dati, escludendo i metodi action dello ZustandStore.
+    return (t as ThemeSettings)[sc] ?? null;
   };
 
   const setForScope = (id: ThemeId | null) => {

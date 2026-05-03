@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { create } from 'zustand';
 import { useStore } from '../lib/store';
 import { useSettings, activeProject } from '../lib/settings';
 import { ChevronRight, FolderIcon } from './icons';
@@ -17,15 +18,47 @@ type FileNode = {
 
 type TreeResponse = { root: string; tree: FileNode[] };
 
+/* ---------- UI state separato dal data store ----------
+ *
+ * Pre-refactor: `expanded: Set<string>` + `pendingDelete: string|null` erano
+ * useState nel componente FileTree, passati come prop a ogni NodeRow.
+ * Risultato: ogni toggle creava un nuovo Set → tutti i NodeRow ri-renderizzavano.
+ *
+ * Post-refactor: store Zustand dedicato. Ogni NodeRow seleziona un boolean
+ * (`isExpanded(path)`, `isPendingDelete(path)`) → re-render solo del nodo
+ * effettivamente cambiato. Combina con React.memo + selettori granulari su
+ * activeFile/openFiles/streamingFiles per il vero salto perf.
+ */
+type FileTreeUI = {
+  expanded: ReadonlySet<string>;
+  pendingDelete: string | null;
+  toggle: (path: string) => void;
+  setExpanded: (paths: Iterable<string>) => void;
+  setPendingDelete: (path: string | null) => void;
+};
+const useFileTreeUI = create<FileTreeUI>((set) => ({
+  expanded: new Set(),
+  pendingDelete: null,
+  toggle: (path) =>
+    set((s) => {
+      const next = new Set(s.expanded);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return { expanded: next };
+    }),
+  setExpanded: (paths) => set({ expanded: new Set(paths) }),
+  setPendingDelete: (path) => set({ pendingDelete: path }),
+}));
+
 export function FileTree() {
   const settings = useSettings((s) => s.settings);
   const active = activeProject(settings);
   const [data, setData] = useState<TreeResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState('');
-  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const setExpanded = useFileTreeUI((s) => s.setExpanded);
+  const setPendingDelete = useFileTreeUI((s) => s.setPendingDelete);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -35,24 +68,29 @@ export function FileTree() {
       if (!r.ok) throw new Error(await r.text());
       const j = (await r.json()) as TreeResponse;
       setData(j);
-      setExpanded(new Set(j.tree.filter((n) => n.isDir).map((n) => n.path)));
+      setExpanded(j.tree.filter((n) => n.isDir).map((n) => n.path));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [setExpanded]);
 
   // Ricarica il tree quando il progetto attivo cambia (incluso il primo mount).
   useEffect(() => { void load(); }, [load, active?.id]);
 
-  const toggle = (path: string) =>
-    setExpanded((s) => {
-      const next = new Set(s);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
+  // Stabile: confirmDelete viene memoizzata così NodeRow + React.memo non
+  // invalida ad ogni render del padre. La closure cattura `load` (stabile
+  // via useCallback) → safe.
+  const confirmDelete = useCallback(async (p: string) => {
+    const ok = await deleteFsEntry(p);
+    setPendingDelete(null);
+    if (ok) {
+      // se il file era aperto in editor, chiudi il tab
+      useStore.getState().closeFile(p);
+      await load();
+    }
+  }, [load, setPendingDelete]);
 
   const filteredTree = useMemo(() => {
     if (!data || !filter.trim()) return data?.tree ?? [];
@@ -70,21 +108,22 @@ export function FileTree() {
     return data.tree.map(matches).filter((n): n is FileNode => n !== null);
   }, [data, filter]);
 
-  // se c'è un filtro attivo, espandi tutto
-  const effectiveExpanded = useMemo(() => {
-    if (!filter.trim() || !data) return expanded;
-    const all = new Set<string>();
+  // Quando c'è un filtro, forziamo expand di tutte le dir mostrate. Lo
+  // applichiamo all'UI store così i NodeRow figli leggono il bool dal selettore.
+  useEffect(() => {
+    if (!filter.trim() || !data) return;
+    const all: string[] = [];
     const walk = (nodes: FileNode[]) => {
       for (const n of nodes) {
         if (n.isDir) {
-          all.add(n.path);
+          all.push(n.path);
           if (n.children) walk(n.children);
         }
       }
     };
     walk(filteredTree);
-    return all;
-  }, [filter, expanded, filteredTree, data]);
+    setExpanded(all);
+  }, [filter, filteredTree, data, setExpanded]);
 
   return (
     <div className="ftree">
@@ -115,19 +154,7 @@ export function FileTree() {
             key={node.path}
             node={node}
             depth={0}
-            expanded={effectiveExpanded}
-            onToggle={toggle}
-            pendingDelete={pendingDelete}
-            requestDelete={setPendingDelete}
-            confirmDelete={async (p) => {
-              const ok = await deleteFsEntry(p);
-              setPendingDelete(null);
-              if (ok) {
-                // se il file era aperto in editor, chiudi il tab
-                useStore.getState().closeFile(p);
-                await load();
-              }
-            }}
+            confirmDelete={confirmDelete}
           />
         ))}
       </div>
@@ -135,33 +162,37 @@ export function FileTree() {
   );
 }
 
-function NodeRow({
-  node, depth, expanded, onToggle, pendingDelete, requestDelete, confirmDelete,
-}: {
+type NodeRowProps = {
   node: FileNode;
   depth: number;
-  expanded: Set<string>;
-  onToggle: (path: string) => void;
-  pendingDelete: string | null;
-  requestDelete: (path: string | null) => void;
-  confirmDelete: (path: string) => Promise<void>;
-}) {
-  const activeFile = useStore((s) => s.activeFile);
-  const openFiles = useStore((s) => s.openFiles);
-  const streamingFiles = useStore((s) => s.streamingFiles);
+  confirmDelete: (path: string) => Promise<void> | void;
+};
+
+/** NodeRow memoizzato. Re-renderizza solo se:
+ *  - cambia il `node` (riferimento) o `depth` (parent passa fresh)
+ *  - cambia uno dei boolean per-path che leggiamo via selettore granulare
+ *  Il `confirmDelete` è memoizzato dal padre via useCallback → stabile.
+ *
+ *  Selettori dello store globale: ognuno torna un boolean → con il default
+ *  shallow-eq di Zustand (Object.is su primitive) il componente si rende
+ *  solo quando QUEL boolean cambia. Pre-refactor: selettori che ritornavano
+ *  Record/Array invalidavano ogni nodo a ogni edit/scroll/streaming.
+ */
+const NodeRow = memo(function NodeRow({ node, depth, confirmDelete }: NodeRowProps) {
+  const isActive = useStore((s) => s.activeFile === node.path);
+  const isOpenInTab = useStore((s) => s.openFiles.includes(node.path));
+  const isStreaming = useStore((s) => s.streamingFiles[node.path] !== undefined);
   const setActiveFile = useStore((s) => s.setActiveFile);
 
-  const isOpen = expanded.has(node.path);
-  const isActive = activeFile === node.path;
-  const isOpenInTab = openFiles.includes(node.path);
-  const isStreaming = streamingFiles[node.path] !== undefined;
+  const isExpanded = useFileTreeUI((s) => s.expanded.has(node.path));
+  const isPendingDelete = useFileTreeUI((s) => s.pendingDelete === node.path);
+  const toggle = useFileTreeUI((s) => s.toggle);
+  const setPendingDelete = useFileTreeUI((s) => s.setPendingDelete);
 
   const onClick = () => {
-    if (node.isDir) onToggle(node.path);
+    if (node.isDir) toggle(node.path);
     else setActiveFile(node.path);
   };
-
-  const isPendingDelete = pendingDelete === node.path;
 
   return (
     <>
@@ -174,7 +205,7 @@ function NodeRow({
           onClick={onClick}
           title={node.path}
         >
-          <span className={`fnode__chev ${node.isDir && isOpen ? 'fnode__chev--open' : ''}`}>
+          <span className={`fnode__chev ${node.isDir && isExpanded ? 'fnode__chev--open' : ''}`}>
             {node.isDir && <ChevronRight size={9} />}
           </span>
           <span className="fnode__icon">
@@ -190,7 +221,7 @@ function NodeRow({
           <button
             className="fnode__trash"
             title={node.isDir ? 'delete folder (recursive)' : 'delete file'}
-            onClick={(e) => { e.stopPropagation(); requestDelete(node.path); }}
+            onClick={(e) => { e.stopPropagation(); setPendingDelete(node.path); }}
           >
             ✕
           </button>
@@ -200,26 +231,22 @@ function NodeRow({
         <div className="fnode-confirm" style={{ paddingLeft: 8 + depth * 12 }}>
           <span>delete <b>{node.name}</b>{node.isDir ? ' and everything inside' : ''}?</span>
           <div className="fnode-confirm__actions">
-            <button className="fnode-confirm__cancel" onClick={() => requestDelete(null)}>cancel</button>
+            <button className="fnode-confirm__cancel" onClick={() => setPendingDelete(null)}>cancel</button>
             <button className="fnode-confirm__yes" onClick={() => confirmDelete(node.path)}>delete</button>
           </div>
         </div>
       )}
-      {node.isDir && isOpen && node.children?.map((child) => (
+      {node.isDir && isExpanded && node.children?.map((child) => (
         <NodeRow
           key={child.path}
           node={child}
           depth={depth + 1}
-          expanded={expanded}
-          onToggle={onToggle}
-          pendingDelete={pendingDelete}
-          requestDelete={requestDelete}
           confirmDelete={confirmDelete}
         />
       ))}
     </>
   );
-}
+});
 
 function iconFor(name: string): string {
   const ext = name.split('.').pop()?.toLowerCase();

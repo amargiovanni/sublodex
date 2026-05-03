@@ -85,12 +85,18 @@ function whichBin(name: string, candidates: string[] = []): string | null {
   return null;
 }
 
+/* ---------- log strutturato ---------- */
+// Implementazione spostata in `src-server/log.ts` (Fase 3.1).
+// Riesporto per compat dei consumer esterni che leggono `log` da server.ts.
+import { log } from './src-server/log';
+export { log };
+
 const SSHPASS_BIN = whichBin('sshpass', [
   '/opt/homebrew/bin/sshpass',
   '/usr/local/bin/sshpass',
   '/usr/bin/sshpass',
 ]);
-console.error(`[claude-web] sshpass resolved to: ${SSHPASS_BIN ?? '(not found)'}`);
+log.info('boot', 'sshpass resolved', { path: SSHPASS_BIN ?? '(not found)' });
 
 const PORT = Number(process.env.PORT ?? 3001);
 /** Dove vive `settings.json` + `conversations/`.
@@ -186,10 +192,26 @@ function slugify(s: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 40) || 'project';
 }
+/** Validazione projectId: gli ID sono generati internamente via
+ *  `crypto.randomUUID()` (formato UUID v4) o sono stringhe ASCII
+ *  semplici. Restringere a `[A-Za-z0-9_-]{1,64}` evita path traversal
+ *  in `sessionsDir` e file. */
+function isValidProjectId(id: string): boolean {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+}
+
+/** Sanitizza un projectId per uso in path. Stessa whitelist di
+ *  `sessionFilePath`: tutto ciò che non è in [A-Za-z0-9_-] diventa `_`,
+ *  troncato a 64 chars. Difesa in profondità anche se il chiamante
+ *  ha già validato. */
+function safeProjectId(id: string): string {
+  return id.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || '_';
+}
+
 /** Directory delle conversazioni per un progetto: una sotto-cartella
  *  dedicata. Ogni session è un file `<sessionId>.json`. */
 function sessionsDir(projectId: string): string {
-  return path.join(DATA_DIR, 'conversations', projectId);
+  return path.join(DATA_DIR, 'conversations', safeProjectId(projectId));
 }
 
 /** Path al file della singola sessione. */
@@ -343,45 +365,133 @@ async function persistSettings(s: Settings): Promise<void> {
   await writeFile(SETTINGS_FILE, JSON.stringify(s, null, 2));
 }
 
+/* ---------- redact: niente password SSH nei response API ----------
+ *
+ * Sentinel scambiata col frontend: se la UI riceve `password: SENTINEL`
+ * sa che c'è una password salvata ma non la mostra; quando salva senza
+ * modificarla, rimanda il sentinel — il backend lo riconosce e tiene la
+ * password originale dal disk. Sentinel scelto = stringa improbabile
+ * come vera password (UUID-like).
+ *
+ * Senza questo, GET /api/health e /api/settings ritornavano la password
+ * SSH in chiaro nel JSON (e la UI la teneva in zustand persisted →
+ * disco, log, browser DevTools network tab). */
+const PWD_REDACT_SENTINEL = '__SUBLODEX_PWD_KEEP__';
+
+function redactProject(p: Project): Project {
+  if (!p.remote?.password) return p;
+  return { ...p, remote: { ...p.remote, password: PWD_REDACT_SENTINEL } };
+}
+
+function redactSettings(s: Settings): Settings {
+  return { ...s, projects: s.projects.map(redactProject) };
+}
+
+/** Riapplica le password originali sui progetti che hanno il sentinel.
+ *  Match per id col `current` (settings in memoria). Se l'id non matcha
+ *  o l'incoming non ha sentinel, lascia com'è — niente surprise:
+ *  - sentinel + match → password preservata (utente non l'ha cambiata)
+ *  - stringa diversa → la nuova password vince
+ *  - undefined/empty → rimossa (utente ha svuotato il campo) */
+function unredactSettings(incoming: Settings, current: Settings): Settings {
+  const byId = new Map(current.projects.map((p) => [p.id, p]));
+  return {
+    ...incoming,
+    projects: incoming.projects.map((p) => {
+      if (p.remote?.password !== PWD_REDACT_SENTINEL) return p;
+      const existing = byId.get(p.id);
+      const realPwd = existing?.remote?.password;
+      if (!realPwd) {
+        // sentinel ma non c'è password esistente → rimuovi il campo
+        const { password: _omit, ...rest } = p.remote;
+        return { ...p, remote: rest };
+      }
+      return { ...p, remote: { ...p.remote, password: realPwd } };
+    }),
+  };
+}
+
 /* ---------- SSH helpers (per progetti remoti) ---------- */
 
-/** Valida un nome ref git: solo char "sicuri" da passare a `git diff X...Y`,
- *  esclude metacaratteri shell. */
-function isSafeRef(ref: string): boolean {
-  if (!ref || ref.length > 200) return false;
-  return /^[A-Za-z0-9._/-]+$/.test(ref);
-}
+// Pure utilities estratte in src-server/shell-utils.ts (Fase 3.1).
+import {
+  isSafeRef,
+  isSafeStashRef,
+  isSafeRelativePath,
+  shellQuote,
+  joinRemote,
+  isSshFatalError,
+} from './src-server/shell-utils';
 
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
+/** Risolve un path relativo al progetto (locale o remoto) confinandolo
+ *  alla root del progetto. Rifiuta path assoluti e traversal con `..`.
+ *  Ritorna `{ ok:true, abs }` o `{ ok:false, status, error }`.
+ *
+ *  Usata da GET/PUT/DELETE su /api/file. Il frontend (FileTree, Editor)
+ *  passa SEMPRE path relativi alla root, quindi accettare path assoluti
+ *  è un buco di traversal puro: non c'è caso d'uso legittimo. */
+type PathResolution =
+  | { ok: true; abs: string }
+  | { ok: false; status: 400 | 403; error: string };
 
-function joinRemote(base: string, rel: string): string {
-  if (rel.startsWith('/')) return rel;
-  return base.replace(/\/+$/, '') + '/' + rel.replace(/^\/+/, '');
-}
+function resolveProjectPath(project: Project, rel: string): PathResolution {
+  if (typeof rel !== 'string' || rel.length === 0) {
+    return { ok: false, status: 400, error: 'invalid path: empty' };
+  }
+  if (rel.length > 4096) {
+    return { ok: false, status: 400, error: 'invalid path: too long' };
+  }
+  // Niente NUL byte (vecchio trucco di bypass).
+  if (rel.includes('\0')) {
+    return { ok: false, status: 400, error: 'invalid path: null byte' };
+  }
+  // Niente path assoluti dal client. Mai. La root è quella del progetto.
+  if (path.isAbsolute(rel) || rel.startsWith('/')) {
+    return { ok: false, status: 400, error: 'invalid path: absolute path not allowed' };
+  }
 
-/** Heuristic: è uno stderr di SSH che indica un *vero* fallimento? */
-function isSshFatalError(stderr: string): boolean {
-  if (!stderr) return false;
-  const fatal = [
-    'Permission denied',
-    'Connection refused',
-    'Connection timed out',
-    'Could not resolve hostname',
-    'No route to host',
-    'Host key verification failed',
-    'kex_exchange_identification',
-    'sshpass: invalid option',
-    'sshpass: failed',
-    'no such identity',
-  ];
-  return fatal.some((s) => stderr.includes(s));
+  const root = project.path;
+
+  if (project.remote) {
+    // Remoto: normalizza POSIX (separatori `/`), poi verifica containment.
+    const normalized = path.posix.normalize(rel);
+    // Dopo normalize i `..` residui in testa indicano traversal sopra root.
+    if (normalized === '..' || normalized.startsWith('../') || normalized === '.' && rel === '..') {
+      return { ok: false, status: 403, error: 'forbidden: path outside project' };
+    }
+    if (normalized.split('/').some((seg) => seg === '..')) {
+      return { ok: false, status: 403, error: 'forbidden: path traversal' };
+    }
+    // Normalizziamo il risultato del join per eliminare `/.` o `//`
+    // ridondanti. Senza questa normalize, `path=.` produrrebbe `<root>/.`
+    // che startsWith `<root>/` ma non è === root → la difesa esterna sul
+    // DELETE non scatta e il rm remoto fallisce con 500 invece di 403.
+    const abs = path.posix.normalize(joinRemote(root, normalized));
+    const rootWithSep = root.replace(/\/+$/, '') + '/';
+    if (abs !== root && !abs.startsWith(rootWithSep)) {
+      return { ok: false, status: 403, error: 'forbidden: path outside project' };
+    }
+    return { ok: true, abs };
+  }
+
+  // Locale: path.resolve risolve `..` e `.`, poi confiniamo a root.
+  const abs = path.resolve(root, rel);
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  if (abs !== root && !abs.startsWith(rootWithSep)) {
+    return { ok: false, status: 403, error: 'forbidden: path outside project' };
+  }
+  return { ok: true, abs };
 }
 
 /** Costruisce gli argomenti del comando ssh dato un RemoteConfig.
- *  Restituisce { argv } pronto per Bun.spawn. Aggiunge sshpass se serve. */
-function buildSshCommand(remote: RemoteConfig, opts: { tty?: boolean; remoteShell: string }): string[] {
+ *  Restituisce { argv, env } pronto per Bun.spawn. Aggiunge sshpass se serve.
+ *
+ *  Sicurezza: con `remote.password` set, NON usiamo `sshpass -p <pwd>` perché
+ *  la password finirebbe in `argv` e quindi visibile in `ps aux`. Usiamo
+ *  invece `sshpass -e` che legge la password dalla env var `SSHPASS`. */
+type SshSpawn = { argv: string[]; env?: Record<string, string> };
+
+function buildSshCommand(remote: RemoteConfig, opts: { tty?: boolean; remoteShell: string }): SshSpawn {
   const sshFlags: string[] = [];
   if (opts.tty) sshFlags.push('-tt');
   if (remote.port && remote.port !== 22) sshFlags.push('-p', String(remote.port));
@@ -400,11 +510,15 @@ function buildSshCommand(remote: RemoteConfig, opts: { tty?: boolean; remoteShel
   const sshArgs = [...sshFlags, target, opts.remoteShell];
 
   if (remote.password) {
-    // Usiamo il path assoluto se l'abbiamo trovato; altrimenti speriamo
-    // che PATH lo trovi (e se non lo trova, l'errore è chiaro).
-    return [SSHPASS_BIN ?? 'sshpass', '-p', remote.password, 'ssh', ...sshArgs];
+    // sshpass -e legge la password da $SSHPASS, NON da argv.
+    // Usiamo path assoluto se trovato in PATH/Homebrew; altrimenti
+    // speriamo che PATH lo trovi (e se non lo trova, l'errore è chiaro).
+    return {
+      argv: [SSHPASS_BIN ?? 'sshpass', '-e', 'ssh', ...sshArgs],
+      env: { ...process.env, SSHPASS: remote.password } as Record<string, string>,
+    };
   }
-  return ['ssh', ...sshArgs];
+  return { argv: ['ssh', ...sshArgs] };
 }
 
 /** Esegue un comando one-shot sul remote host via SSH. Timeout di default 15s. */
@@ -414,10 +528,10 @@ async function sshExec(
   stdin?: string,
   timeoutMs = 15_000,
 ): Promise<{ ok: boolean; stdout: string; stderr: string; code: number }> {
-  const argv = buildSshCommand(remote, { remoteShell: remoteCmd });
+  const { argv, env } = buildSshCommand(remote, { remoteShell: remoteCmd });
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(argv, { stdio: ['pipe', 'pipe', 'pipe'] });
+    proc = Bun.spawn(argv, { stdio: ['pipe', 'pipe', 'pipe'], env });
   } catch (err) {
     return { ok: false, stdout: '', stderr: `cannot spawn ssh: ${(err as Error).message}`, code: -1 };
   }
@@ -770,7 +884,29 @@ type PlanUsage = {
   subscriptionType?: string;
   rawHeaders: Record<string, string>;       // tutto quello che inizia con anthropic-ratelimit-
   fetchedAt: number;
+  // Campi best-effort arricchiti da fetchClaudeAiExtras() (endpoint privati,
+  // possono mancare). Tipi forward-declared, le definizioni sono sotto.
+  billing?: Billing;
+  weeklyBreakdown?: { name: string; utilization: number; resetsAt?: number }[];
+  dailyRoutines?: { used: number; total: number };
+  debug?: { url: string; status: number; ok: boolean; sample?: string }[];
 };
+
+/** Cache in-memory di /api/usage per ridurre round-trip a api.claude.ai.
+ *  TTL breve (60s): la quota cambia di rado, ma vogliamo che un nuovo
+ *  login/cambio piano si rifletta abbastanza in fretta.
+ *  In caso di errore, NON cachiamo: ritentiamo subito al prossimo GET. */
+const USAGE_CACHE_TTL_MS = 60_000;
+let _usageCache: { value: PlanUsage; at: number } | null = null;
+async function getUsageCached(): Promise<PlanUsage> {
+  const now = Date.now();
+  if (_usageCache && (now - _usageCache.at) < USAGE_CACHE_TTL_MS) {
+    return _usageCache.value;
+  }
+  const v = await fetchPlanUsage();
+  _usageCache = { value: v, at: now };
+  return v;
+}
 
 async function fetchPlanUsage(): Promise<PlanUsage> {
   let creds = (await readCredentialsFile()) ?? (await readKeychain());
@@ -843,10 +979,10 @@ async function fetchPlanUsage(): Promise<PlanUsage> {
   // Tutto quello che è non-rate-limit-headers è speculativo e undocumented.
   try {
     const extra = await fetchClaudeAiExtras(creds.accessToken);
-    if (extra.billing) (usage as any).billing = extra.billing;
-    if (extra.weeklyBreakdown) (usage as any).weeklyBreakdown = extra.weeklyBreakdown;
-    if (extra.dailyRoutines) (usage as any).dailyRoutines = extra.dailyRoutines;
-    if (extra.debug) (usage as any).debug = extra.debug;
+    if (extra.billing) usage.billing = extra.billing;
+    if (extra.weeklyBreakdown) usage.weeklyBreakdown = extra.weeklyBreakdown;
+    if (extra.dailyRoutines) usage.dailyRoutines = extra.dailyRoutines;
+    if (extra.debug) usage.debug = extra.debug;
   } catch { /* swallow */ }
 
   return usage;
@@ -1074,21 +1210,25 @@ async function runClaude(
   // resource Tauri e il path passato qui via env. In dev (no env) il SDK lo
   // risolve da node_modules come al solito.
   if (process.env.SUBLODEX_CLAUDE_BIN) {
-    (opts as any).pathToClaudeCodeExecutable = process.env.SUBLODEX_CLAUDE_BIN;
+    // `pathToClaudeCodeExecutable` non è esposto nei types pubblici del SDK
+    // ma è un'opzione runtime supportata. Cast tipato a Record per non usare
+    // `as any`, mantenendo intent esplicito.
+    (opts as unknown as Record<string, unknown>).pathToClaudeCodeExecutable =
+      process.env.SUBLODEX_CLAUDE_BIN;
   }
 
   try {
-    console.error(`[claude] starting prompt="${prompt.slice(0, 80)}" cwd=${project.path}`);
+    log.info('claude', 'starting', { prompt: prompt.slice(0, 80), cwd: project.path });
     for await (const msg of query({ prompt, options: opts })) {
       send({ type: 'event', event: msg as unknown as Record<string, unknown> });
     }
-    console.error('[claude] done');
+    log.info('claude', 'done');
   } catch (err) {
     if (ac.signal.aborted) {
-      console.error('[claude] aborted by user');
+      log.info('claude', 'aborted by user');
     } else {
       const errMsg = err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err);
-      console.error(`[claude] ERROR: ${errMsg}`);
+      log.error('claude', 'fatal', { err: errMsg });
       send({ type: 'error', error: err instanceof Error ? err.message : String(err) });
     }
   }
@@ -1116,8 +1256,8 @@ async function runClaudeRemote(
   if (sessionId) flags.push('--resume', shellQuote(sessionId));
 
   const remoteCmd = `cd ${shellQuote(project.path)} && claude ${flags.join(' ')}`;
-  const argv = buildSshCommand(project.remote!, { tty: true, remoteShell: remoteCmd });
-  const proc = Bun.spawn(argv, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const { argv, env } = buildSshCommand(project.remote!, { tty: true, remoteShell: remoteCmd });
+  const proc = Bun.spawn(argv, { stdio: ['ignore', 'pipe', 'pipe'], env });
 
   ac.signal.addEventListener('abort', () => { try { proc.kill(); } catch { /* */ } });
 
@@ -1126,6 +1266,11 @@ async function runClaudeRemote(
   const reader = proc.stdout.getReader();
   const dec = new TextDecoder();
   let stderrBuf = '';
+  // Limite buffer di assemblaggio: protegge da loop runaway che generassero
+  // una singola "riga" enorme senza mai newline. Truncamento a 8MB con
+  // best-effort: parsiamo quello che abbiamo e resettiamo per riprendere
+  // senza far esplodere la memoria del bun server.
+  const MAX_BUF_BYTES = 8 * 1024 * 1024;
 
   // Leggi stderr in parallelo per debug se la richiesta fallisce
   (async () => {
@@ -1143,6 +1288,12 @@ async function runClaudeRemote(
       const { value, done } = await reader.read();
       if (done) break;
       buf += dec.decode(value);
+      if (buf.length > MAX_BUF_BYTES) {
+        // Drop preventivo del buffer: log e reset. Non killiamo il proc
+        // (potrebbe stabilizzarsi), ma evitiamo accumulo illimitato.
+        log.warn('claude:remote', 'stdout buffer exceeded without newline — truncating', { maxBytes: MAX_BUF_BYTES });
+        buf = buf.slice(-1024); // tieni una coda minima per riallineare
+      }
       const lines = buf.split('\n');
       buf = lines.pop() ?? '';
       for (const line of lines) {
@@ -1155,6 +1306,18 @@ async function runClaudeRemote(
           // riga non-JSON (es. messaggio diagnostico ssh)
         }
       }
+    }
+    // Flush finale: se l'ultima riga arriva senza '\n' rimane in buf.
+    // Pre-fix: l'evento veniva perso silenziosamente.
+    const tail = buf.trim();
+    if (tail) {
+      try {
+        const ev = JSON.parse(tail);
+        send({ type: 'event', event: ev });
+      } catch {
+        // tail non-JSON (es. trailing newline mancante su un diag SSH)
+      }
+      buf = '';
     }
   } catch (err) {
     if (!ac.signal.aborted) {
@@ -1208,7 +1371,7 @@ async function listRemoteTree(remote: RemoteConfig, root: string): Promise<FileN
   const lines = r.stdout.split('\n').map((l) => l.trim()).filter((l) => l && l !== '.');
   if (lines.length === 0) {
     // log diagnostico solo se davvero non c'è nulla
-    if (r.stderr) console.error(`[tree] remote ${root}: empty tree, stderr=${r.stderr.slice(0, 300)}`);
+    if (r.stderr) log.warn('tree', 'empty remote tree', { root, stderr: r.stderr.slice(0, 300) });
     return [];
   }
   // Costruzione albero
@@ -1672,11 +1835,36 @@ async function readPluginsState(project: Project): Promise<PluginsState> {
 
 /* ---------- server ---------- */
 
+// Auth + CSP + HTML token injection: spostato in src-server/auth.ts (Fase 3.1).
+import {
+  AUTH_ENABLED,
+  AUTH_TOKEN,
+  tokenFromRequest,
+  timingSafeEqualStr,
+  htmlHeaders,
+  injectAuthToken,
+} from './src-server/auth';
+
 const server = Bun.serve<WsData, {}>({
   port: PORT,
   hostname: '127.0.0.1',
   async fetch(req, server) {
     const url = new URL(req.url);
+
+    // ----- Auth gate -----
+    // Solo le rotte API e WS sono protette. Le statiche servono l'HTML che
+    // contiene il token, e gli asset (JS/CSS/img). Niente token = niente
+    // chiamate API, quindi non c'è leak.
+    if (AUTH_ENABLED) {
+      const isApi = url.pathname.startsWith('/api/');
+      const isWs = url.pathname === '/ws';
+      if (isApi || isWs) {
+        const t = tokenFromRequest(req, url);
+        if (!t || !timingSafeEqualStr(t, AUTH_TOKEN!)) {
+          return new Response('unauthorized', { status: 401 });
+        }
+      }
+    }
 
     if (url.pathname === '/ws') {
       const ok = server.upgrade(req, {
@@ -1690,7 +1878,7 @@ const server = Bun.serve<WsData, {}>({
     // più subprocess Node per il terminale.)
 
     if (url.pathname === '/api/health') {
-      return Response.json({ ok: true, settings });
+      return Response.json({ ok: true, settings: redactSettings(settings) });
     }
 
     if (url.pathname === '/api/diagnostics' && req.method === 'GET') {
@@ -1698,8 +1886,11 @@ const server = Bun.serve<WsData, {}>({
     }
 
     if (url.pathname === '/api/usage' && req.method === 'GET') {
+      // Cache TTL 60s: la quota Claude non cambia ogni secondo, e la
+      // UsageCard sul frontend è polled di frequente. Riduciamo il
+      // round-trip verso api.claude.ai e i timeout occasionali.
       try {
-        const u = await fetchPlanUsage();
+        const u = await getUsageCached();
         return Response.json(u);
       } catch (err) {
         return Response.json(
@@ -1716,14 +1907,36 @@ const server = Bun.serve<WsData, {}>({
       const env = { ...process.env };
       delete env.ANTHROPIC_API_KEY;
       delete env.ANTHROPIC_AUTH_TOKEN;
+      // Timeout: se l'utente non completa il flow OAuth, killiamo il processo
+      // dopo 5 minuti per evitare zombie process. Configurabile via env var.
+      const LOGIN_TIMEOUT_MS = Number(process.env.SUBLODEX_LOGIN_TIMEOUT_MS) || 5 * 60_000;
       return new Promise<Response>((resolve) => {
         const proc = spawn('claude', ['/login'], { stdio: ['ignore', 'pipe', 'pipe'], env });
         let out = '';
         let err = '';
+        let resolved = false;
+        const settle = (resp: Response): void => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(killTimer);
+          resolve(resp);
+        };
+        const killTimer = setTimeout(() => {
+          try { proc.kill('SIGTERM'); } catch { /* */ }
+          // Grace period prima di SIGKILL.
+          setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* */ } }, 3_000);
+          settle(Response.json({
+            ok: false,
+            timedOut: true,
+            error: `login timed out after ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s`,
+            stdout: out.trim(),
+            stderr: err.trim(),
+          }, { status: 504 }));
+        }, LOGIN_TIMEOUT_MS);
         proc.stdout.on('data', (c: Buffer) => { out += c.toString(); });
         proc.stderr.on('data', (c: Buffer) => { err += c.toString(); });
         proc.on('close', (code) => {
-          resolve(Response.json({
+          settle(Response.json({
             ok: code === 0,
             code,
             stdout: out.trim(),
@@ -1731,7 +1944,7 @@ const server = Bun.serve<WsData, {}>({
           }));
         });
         proc.on('error', (e) => {
-          resolve(Response.json({ ok: false, error: e.message }, { status: 500 }));
+          settle(Response.json({ ok: false, error: e.message }, { status: 500 }));
         });
       });
     }
@@ -1753,11 +1966,15 @@ const server = Bun.serve<WsData, {}>({
     }
 
     if (url.pathname === '/api/settings' && req.method === 'GET') {
-      return Response.json(settings);
+      return Response.json(redactSettings(settings));
     }
 
     if (url.pathname === '/api/settings' && req.method === 'PUT') {
       const body = (await req.json()) as Partial<Settings>;
+      // Costruisci il candidate, poi unredact: ogni progetto incoming con
+      // `remote.password === SENTINEL` ripristina la password originale dal
+      // settings in memoria (match per id). L'utente vede asterischi in UI;
+      // se non li tocca, la password rimane invariata.
       const candidate: Settings = {
         activeId: body.activeId ?? settings.activeId,
         projects: (body.projects ?? settings.projects).map((p) => {
@@ -1790,12 +2007,16 @@ const server = Bun.serve<WsData, {}>({
           };
         }),
       };
-      const err = validateSettings(candidate);
+      // Riapplica le password reali dove arriva il sentinel (= utente non ha
+      // toccato il campo password in UI). Va fatto PRIMA della validazione
+      // per non far cadere progetti con sentinel (che non è una password vera).
+      const merged = unredactSettings(candidate, settings);
+      const err = validateSettings(merged);
       if (err) return new Response(err, { status: 400 });
 
       // crea le cartelle dei progetti LOCALI che non esistono. Per i remoti
       // non possiamo (e non vogliamo) toccare il filesystem remoto qui.
-      for (const p of candidate.projects) {
+      for (const p of merged.projects) {
         if (p.remote) continue;
         try { await mkdir(p.path, { recursive: true }); }
         catch (e) { return new Response(`mkdir ${p.path}: ${(e as Error).message}`, { status: 400 }); }
@@ -1807,16 +2028,16 @@ const server = Bun.serve<WsData, {}>({
         }
       }
 
-      settings = candidate;
+      settings = merged;
       await persistSettings(settings);
       // CLAUDE.md è scritto in background: per progetti remoti l'SSH può
       // essere lento e bloccherebbe la response. Errori vengono solo loggati.
       for (const p of settings.projects) {
         void writeClaudeMdFor(p).catch((err) => {
-          console.error(`[settings] CLAUDE.md "${p.name}" failed:`, err);
+          log.warn('settings', 'CLAUDE.md write failed', { project: p.name, err: String(err) });
         });
       }
-      return Response.json(settings);
+      return Response.json(redactSettings(settings));
     }
 
     if (url.pathname === '/api/test-ssh' && req.method === 'POST') {
@@ -1897,14 +2118,16 @@ const server = Bun.serve<WsData, {}>({
       const p = url.searchParams.get('path');
       if (!p) return new Response('missing path', { status: 400 });
       const project = activeProject(settings);
-      const abs = path.isAbsolute(p) ? p : (project.remote ? joinRemote(project.path, p) : path.resolve(project.path, p));
+      const resolved = resolveProjectPath(project, p);
+      if (!resolved.ok) return new Response(resolved.error, { status: resolved.status });
+      const abs = resolved.abs;
       if (project.remote) {
         const r = await sshExec(project.remote, `cat -- ${shellQuote(abs)}`);
         // Non ci affidiamo a r.ok (sshpass exit code inaffidabile). Se stderr
         // contiene errori SSH veri (Permission denied, Connection refused, …)
         // allora è un fail; altrimenti restituiamo lo stdout così com'è.
         if (isSshFatalError(r.stderr)) {
-          console.error(`[file:GET] remote read failed for ${abs}: ${r.stderr}`);
+          log.warn('file:GET', 'remote read failed', { abs, stderr: r.stderr });
           return new Response('', { status: 200 });
         }
         return new Response(r.stdout, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
@@ -1921,7 +2144,9 @@ const server = Bun.serve<WsData, {}>({
       const p = url.searchParams.get('path');
       if (!p) return new Response('missing path', { status: 400 });
       const project = activeProject(settings);
-      const abs = path.isAbsolute(p) ? p : (project.remote ? joinRemote(project.path, p) : path.resolve(project.path, p));
+      const resolved = resolveProjectPath(project, p);
+      if (!resolved.ok) return new Response(resolved.error, { status: resolved.status });
+      const abs = resolved.abs;
       const content = await req.text();
       if (project.remote) {
         const dir = abs.replace(/\/[^/]*$/, '') || '/';
@@ -1943,10 +2168,14 @@ const server = Bun.serve<WsData, {}>({
       const p = url.searchParams.get('path');
       if (!p) return new Response('missing path', { status: 400 });
       const project = activeProject(settings);
-      const abs = path.isAbsolute(p) ? p : (project.remote ? joinRemote(project.path, p) : path.resolve(project.path, p));
-      const root = project.path;
-      if (!abs.startsWith(root + (root.endsWith('/') ? '' : '/')) && abs !== root) {
-        return new Response('forbidden: path outside project', { status: 403 });
+      const resolved = resolveProjectPath(project, p);
+      if (!resolved.ok) return new Response(resolved.error, { status: resolved.status });
+      const abs = resolved.abs;
+      // Difesa in profondità: rifiuta una delete che combaci esattamente con
+      // la root del progetto (resolveProjectPath la consente per coerenza con
+      // listTree, ma `rm -rf` sulla root sarebbe disastroso).
+      if (abs === project.path) {
+        return new Response('forbidden: cannot delete project root', { status: 403 });
       }
       if (project.remote) {
         const r = await sshExec(project.remote, `rm -rf -- ${shellQuote(abs)} && echo OK_DEL`);
@@ -1964,6 +2193,7 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/conversation/sessions' && req.method === 'GET') {
       const projectId = url.searchParams.get('projectId');
       if (!projectId) return new Response('missing projectId', { status: 400 });
+      if (!isValidProjectId(projectId)) return new Response('invalid projectId', { status: 400 });
       const sessions = await listSessions(projectId);
       return Response.json({ sessions });
     }
@@ -1971,6 +2201,7 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/conversation/sessions' && req.method === 'POST') {
       const projectId = url.searchParams.get('projectId');
       if (!projectId) return new Response('missing projectId', { status: 400 });
+      if (!isValidProjectId(projectId)) return new Response('invalid projectId', { status: 400 });
       const id = await createNewSession(projectId);
       return Response.json({ id });
     }
@@ -1978,6 +2209,7 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/conversation' && req.method === 'GET') {
       const projectId = url.searchParams.get('projectId');
       if (!projectId) return new Response('missing projectId', { status: 400 });
+      if (!isValidProjectId(projectId)) return new Response('invalid projectId', { status: 400 });
       const sid = await resolveSessionId(projectId, url.searchParams.get('sessionId'));
       const file = sessionFilePath(projectId, sid);
       try {
@@ -1998,6 +2230,7 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/conversation' && req.method === 'PUT') {
       const projectId = url.searchParams.get('projectId');
       if (!projectId) return new Response('missing projectId', { status: 400 });
+      if (!isValidProjectId(projectId)) return new Response('invalid projectId', { status: 400 });
       const sid = await resolveSessionId(projectId, url.searchParams.get('sessionId'));
       const body = await req.text();
       const file = sessionFilePath(projectId, sid);
@@ -2009,6 +2242,7 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/conversation' && req.method === 'DELETE') {
       const projectId = url.searchParams.get('projectId');
       if (!projectId) return new Response('missing projectId', { status: 400 });
+      if (!isValidProjectId(projectId)) return new Response('invalid projectId', { status: 400 });
       const sidParam = url.searchParams.get('sessionId');
       if (sidParam) {
         const file = sessionFilePath(projectId, sidParam);
@@ -2040,6 +2274,11 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/git/diff' && req.method === 'GET') {
       const project = activeProject(settings);
       const file = url.searchParams.get('path') ?? '';
+      // file vuoto = diff dell'intero working tree (legittimo). Se valorizzato,
+      // deve essere un path relativo dentro il progetto.
+      if (file && !isSafeRelativePath(file)) {
+        return new Response('invalid path', { status: 400 });
+      }
       const staged = url.searchParams.get('staged') === '1';
       const diff = await readGitDiff(project, file, staged);
       return new Response(diff, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
@@ -2048,7 +2287,9 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/git/stage' && req.method === 'POST') {
       const project = activeProject(settings);
       const { path: file } = (await req.json().catch(() => ({}))) as { path?: string };
-      if (!file) return Response.json({ error: 'path required' }, { status: 400 });
+      if (!file || !isSafeRelativePath(file)) {
+        return Response.json({ error: 'invalid path' }, { status: 400 });
+      }
       const ok = await runGit(project, ['add', '--', file]);
       return Response.json(ok);
     }
@@ -2056,7 +2297,9 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/git/unstage' && req.method === 'POST') {
       const project = activeProject(settings);
       const { path: file } = (await req.json().catch(() => ({}))) as { path?: string };
-      if (!file) return Response.json({ error: 'path required' }, { status: 400 });
+      if (!file || !isSafeRelativePath(file)) {
+        return Response.json({ error: 'invalid path' }, { status: 400 });
+      }
       const ok = await runGit(project, ['reset', 'HEAD', '--', file]);
       return Response.json(ok);
     }
@@ -2130,7 +2373,9 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/git/checkout' && req.method === 'POST') {
       const project = activeProject(settings);
       const { branch, create } = (await req.json().catch(() => ({}))) as { branch?: string; create?: boolean };
-      if (!branch) return Response.json({ error: 'branch required' }, { status: 400 });
+      if (!branch || !isSafeRef(branch)) {
+        return Response.json({ error: 'invalid branch name' }, { status: 400 });
+      }
       const args = create ? ['checkout', '-b', branch] : ['checkout', branch];
       const ok = await runGit(project, args);
       return Response.json(ok);
@@ -2209,7 +2454,9 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/git/discard' && req.method === 'POST') {
       const project = activeProject(settings);
       const { path: file, untracked } = (await req.json().catch(() => ({}))) as { path?: string; untracked?: boolean };
-      if (!file) return Response.json({ error: 'path required' }, { status: 400 });
+      if (!file || !isSafeRelativePath(file)) {
+        return Response.json({ error: 'invalid path' }, { status: 400 });
+      }
       // Per file untracked: rimuoviamo proprio il file (git non sa cos'era).
       // Per tracked: checkout — torna alla versione di HEAD.
       const args = untracked ? ['clean', '-f', '--', file] : ['checkout', 'HEAD', '--', file];
@@ -2248,7 +2495,9 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/git/stash/pop' && req.method === 'POST') {
       const project = activeProject(settings);
       const { ref } = (await req.json().catch(() => ({}))) as { ref?: string };
-      if (!ref) return Response.json({ error: 'ref required' }, { status: 400 });
+      if (!ref || !isSafeStashRef(ref)) {
+        return Response.json({ error: 'invalid stash ref' }, { status: 400 });
+      }
       const ok = await runGit(project, ['stash', 'pop', ref]);
       return Response.json(ok);
     }
@@ -2256,7 +2505,9 @@ const server = Bun.serve<WsData, {}>({
     if (url.pathname === '/api/git/stash/drop' && req.method === 'POST') {
       const project = activeProject(settings);
       const { ref } = (await req.json().catch(() => ({}))) as { ref?: string };
-      if (!ref) return Response.json({ error: 'ref required' }, { status: 400 });
+      if (!ref || !isSafeStashRef(ref)) {
+        return Response.json({ error: 'invalid stash ref' }, { status: 400 });
+      }
       const ok = await runGit(project, ['stash', 'drop', ref]);
       return Response.json(ok);
     }
@@ -2277,11 +2528,23 @@ const server = Bun.serve<WsData, {}>({
     try {
       const f = Bun.file(distFile);
       if (await f.exists()) {
+        // Per index.html iniettiamo il token come `window.__SUBLODEX_TOKEN__`.
+        // È l'unico modo di consegnarlo al frontend prima del primo fetch
+        // (il browser non passa header su navigation request).
+        if (distFile.endsWith('.html')) {
+          return new Response(injectAuthToken(await f.text()), {
+            headers: htmlHeaders(),
+          });
+        }
         return new Response(f);
       }
       // SPA fallback: route lato React → index.html
       const indexHtml = Bun.file(path.join(distRoot, 'index.html'));
-      if (await indexHtml.exists()) return new Response(indexHtml);
+      if (await indexHtml.exists()) {
+        return new Response(injectAuthToken(await indexHtml.text()), {
+          headers: htmlHeaders(),
+        });
+      }
     } catch { /* dist non esiste */ }
 
     return new Response('not found', { status: 404 });
@@ -2335,12 +2598,12 @@ const server = Bun.serve<WsData, {}>({
 });
 
 const ap = activeProject(settings);
-console.log(`[claude-web] http://${server.hostname}:${server.port}`);
-console.log(`[claude-web] active project = ${ap.name} @ ${ap.path}`);
-console.log(`[claude-web] permission     = ${PERMISSION_MODE}`);
+log.info('boot', 'listening', { url: `http://${server.hostname}:${server.port}` });
+log.info('boot', 'active project', { name: ap.name, path: ap.path });
+log.info('boot', 'permission', { mode: PERMISSION_MODE });
 {
   const diag = await getDiagnostics();
-  console.log(`[claude-web] auth           = ${diag.authMethod} — ${diag.authDetail}`);
-  for (const w of diag.warnings) console.log(`[claude-web] warning        = ${w}`);
-  if (USE_API_KEY) console.log('[claude-web] mode           = CLAUDE_WEB_USE_API_KEY=1 (API key opt-in)');
+  log.info('boot', 'auth', { method: diag.authMethod, detail: diag.authDetail });
+  for (const w of diag.warnings) log.warn('boot', w);
+  if (USE_API_KEY) log.info('boot', 'CLAUDE_WEB_USE_API_KEY=1 (API key opt-in)');
 }
